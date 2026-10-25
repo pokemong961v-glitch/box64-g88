@@ -1,0 +1,177 @@
+# Build Box64 tuned for Cortex-A75 / A55 (Helio G88) and repack it as a .wcp
+# for BannerHub's Component Manager.
+#
+# HOW TO USE (phone is fine, use the browser's "Desktop site"):
+#   1. Create a PUBLIC GitHub repo (public = free ARM runners).
+#   2. Add this file as  .github/workflows/box64-g88.yml
+#   3. Actions tab -> "Build Box64 (G88)" -> Run workflow.
+#   4. Paste the direct URL of a Box64 .wcp that ALREADY works in your
+#      BannerHub (e.g. from the Arihany WinlatorWCPHub releases). It is used
+#      as the template, so the folder layout is guaranteed to be what
+#      GameHub expects. Only the box64 binary and profile.json are changed.
+#   5. When it finishes, download the artifact (a zip), unzip it, then in
+#      BannerHub: Component Manager -> Add New -> pick the .wcp.
+#
+# The job STOPS with an error (instead of producing a broken package) if the
+# template's ABI does not match what this job builds.
+#
+# NOT TESTED on a real device. Compiler flags change little for Box64
+# (the fast code is generated at runtime), so expect a small difference.
+
+name: Build Box64 (G88)
+
+on:
+  workflow_dispatch:
+    inputs:
+      template_wcp_url:
+        description: "Direct URL of a Box64 .wcp that already works in your BannerHub"
+        required: true
+        type: string
+      box64_ref:
+        description: "Box64 branch or tag (a release tag is more stable than main)"
+        required: true
+        default: "main"
+        type: string
+      build_image:
+        description: "Build container. Older = runs on older root filesystems"
+        required: true
+        default: "ubuntu:22.04"
+        type: string
+      enable_box32:
+        description: "Build with 32-bit (Box32) support if this Box64 version has it"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    container:
+      image: ${{ inputs.build_image }}
+
+    steps:
+      - name: Install build tools
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential cmake git ca-certificates curl python3 \
+            zstd xz-utils binutils file
+
+      - name: Fetch Box64 source
+        env:
+          REF: ${{ inputs.box64_ref }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "$REF" https://github.com/ptitSeb/box64.git box64
+          echo "BOX64_SHA=$(git -C box64 rev-parse --short HEAD)" >> "$GITHUB_ENV"
+
+      - name: Build (Cortex-A75 / A55 tuned)
+        env:
+          ENABLE_BOX32: ${{ inputs.enable_box32 }}
+        run: |
+          set -euo pipefail
+          cd box64
+          FLAGS="-DCMAKE_BUILD_TYPE=Release -DARM_DYNAREC=ON"
+          # SD845 (Kryo 385 = A75/A55 derivatives) is the closest upstream profile.
+          # If this Box64 version lacks it, fall back to generic arm64 + -mcpu.
+          if grep -q "SD845" CMakeLists.txt; then
+            FLAGS="$FLAGS -DSD845=ON"
+          else
+            FLAGS="$FLAGS -DARM64=ON -DCMAKE_C_FLAGS=-mcpu=cortex-a75 -DCMAKE_CXX_FLAGS=-mcpu=cortex-a75"
+          fi
+          if [ "$ENABLE_BOX32" = "true" ] && grep -q "BOX32" CMakeLists.txt; then
+            FLAGS="$FLAGS -DBOX32=ON"
+          fi
+          echo "cmake flags: $FLAGS"
+          cmake -S . -B build $FLAGS
+          cmake --build build -j"$(nproc)"
+          strip build/box64
+          file build/box64
+
+      - name: Repack into the template WCP
+        env:
+          TEMPLATE_URL: ${{ inputs.template_wcp_url }}
+          REF: ${{ inputs.box64_ref }}
+        run: |
+          set -euo pipefail
+          NEW=box64/build/box64
+
+          curl -fL --retry 3 -o template.wcp "$TEMPLATE_URL"
+
+          # Same compression as the template (Box64/DXVK = zstd, FEX = xz)
+          magic=$(head -c4 template.wcp | od -An -tx1 | tr -d ' \n')
+          case "$magic" in
+            28b52ffd) EXTRACT="tar --zstd -xf"; CREATE="tar --zstd -cf" ;;
+            fd377a58) EXTRACT="tar -xJf";       CREATE="tar -cJf" ;;
+            *) echo "::error::Template is not a zstd/xz tar (magic: $magic). Use a direct .wcp download link."; exit 1 ;;
+          esac
+
+          mkdir stage
+          $EXTRACT template.wcp -C stage
+
+          OLD=$(find stage -type f -name box64 | head -n1 || true)
+          if [ -z "$OLD" ]; then
+            echo "::error::No file named 'box64' in the template. Its contents:"
+            find stage -type f | head -50
+            exit 1
+          fi
+          echo "Replacing: $OLD"
+
+          interp() { readelf -l "$1" 2>/dev/null | sed -n 's/.*Requesting program interpreter: \(.*\)\]/\1/p' || true; }
+          glibc()  { objdump -T "$1" 2>/dev/null | grep -o 'GLIBC_[0-9][0-9.]*' | sort -uV | tail -n1 || true; }
+
+          OLD_I=$(interp "$OLD"); NEW_I=$(interp "$NEW")
+          echo "interpreter  template: ${OLD_I:-none}   new: ${NEW_I:-none}"
+          if [ "$OLD_I" != "$NEW_I" ]; then
+            echo "::error::ABI mismatch. The template and this build use different loaders (for example Android/bionic vs glibc). Stopping so you do not get a broken package."
+            exit 1
+          fi
+
+          OLD_G=$(glibc "$OLD"); NEW_G=$(glibc "$NEW")
+          echo "max glibc    template: ${OLD_G:-none}   new: ${NEW_G:-none}"
+          if [ -n "$OLD_G" ] && [ -n "$NEW_G" ]; then
+            top=$(printf '%s\n%s\n' "$NEW_G" "$OLD_G" | sort -V | tail -n1)
+            if [ "$top" != "$OLD_G" ]; then
+              echo "::error::New build needs $NEW_G but the template only needs $OLD_G. Re-run with an older build_image (for example ubuntu:20.04)."
+              exit 1
+            fi
+          fi
+
+          install -m 0755 "$NEW" "$OLD"
+
+          VER=$(printf '%s' "${REF}-g88-${BOX64_SHA}" | tr -c 'A-Za-z0-9._-' '-')
+          PJ=$(find stage -maxdepth 3 -name profile.json | head -n1 || true)
+          if [ -n "$PJ" ]; then
+            python3 - "$PJ" "$VER" <<'PY'
+          import json, sys
+          path, ver = sys.argv[1], sys.argv[2]
+          with open(path, encoding="utf-8") as f:
+              d = json.load(f)
+          d["versionName"] = ver
+          try:
+              d["versionCode"] = int(d.get("versionCode", 0)) + 1
+          except Exception:
+              d["versionCode"] = 1
+          d["description"] = "Box64 built for Cortex-A75/A55 (Helio G88), repacked from a template"
+          with open(path, "w", encoding="utf-8") as f:
+              json.dump(d, f, indent=2)
+          PY
+          else
+            echo "::warning::No profile.json found in the template; the package keeps the template's name."
+          fi
+
+          mkdir -p out
+          $CREATE "out/Box64-${VER}.wcp" -C stage .
+          ls -l out
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: box64-g88-wcp
+          path: out/*.wcp
+          if-no-files-found: error
